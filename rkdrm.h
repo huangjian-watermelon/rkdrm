@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <vector>
+#include <deque>
 #include "xf86drmMode.h"
 #include <rockchip/mpp_frame.h>
 extern "C"
@@ -67,13 +68,16 @@ public:
     static bool InitDrm();
 
 private:
+    bool AtomicSetPlane(uint32_t fbId, int32_t crtcX, int32_t crtcY, uint32_t crtcWidth,
+                        uint32_t crtcHeight, uint32_t srcWidth, uint32_t srcHeight);
+    bool GetObjectPropertyId(uint32_t objectId, uint32_t objectType, const char *propertyName,
+                             uint32_t &propertyId);
+    bool FreeFrameRes(FrameResourse *&frameRes);
 
     bool DisplayDrmFrame(AVFrame *frame);
     bool DisplayNormalFrame(AVFrame *frame);
 
     bool AllocDrmPrimeFrame(uint32_t width, uint32_t height, AVFrame *frame);
-
-    void FreeDrmFrameAfterDisplay(AVFrame *frame);
 
     static bool OpenDrmFd(std::shared_ptr<int> fd);
 
@@ -111,9 +115,8 @@ private:
         uint64_t size;
         uint8_t *mapping = nullptr;
     } *m_mapRes;
-    FrameResourse *m_frameRes;
+    std::deque<FrameResourse *> m_frameQueue;
     char* m_dataText = nullptr;
     size_t m_dataTextSize = 0;
 };
 #endif // RKDRM_H
-
