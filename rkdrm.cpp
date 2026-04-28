@@ -10,7 +10,9 @@ extern "C" {
 #include <rockchip/mpp_buffer.h>
 #include <rockchip/mpp_time.h>
 }
+#include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -47,7 +49,7 @@ RkDrmDisplay::RkDrmDisplay()
       m_planeIndex(0),
       m_crtcIndex(0),
       m_mapRes(nullptr),
-      m_frameRes(nullptr) {
+      m_flipPending(false) {
     static bool init = RkDrmDisplay::InitDrm();
 }
 
@@ -57,14 +59,157 @@ RkDrmDisplay::~RkDrmDisplay() {
         m_mapRes = nullptr;
     }
 
-    if (m_frameRes) {
-        if (m_frameRes->frame)
-            av_frame_free(&m_frameRes->frame);
-        if (m_frameRes->bufId)
-            drmModeRmFB(*m_devFd, m_frameRes->bufId);
-        drmIoctl(*m_devFd, DRM_IOCTL_GEM_CLOSE, &m_frameRes->gemClose);
-        delete m_frameRes;
+    while (!m_frameQueue.empty()) {
+        FrameResourse *res = m_frameQueue.front();
+        m_frameQueue.pop_front();
+        FreeFrameRes(res);
     }
+}
+
+bool RkDrmDisplay::FreeFrameRes(FrameResourse *&frameRes) {
+    if (!frameRes)
+        return true;
+
+    if (frameRes->frame)
+        av_frame_free(&frameRes->frame);
+    if (frameRes->bufId)
+        drmModeRmFB(*m_devFd, frameRes->bufId);
+    drmIoctl(*m_devFd, DRM_IOCTL_GEM_CLOSE, &frameRes->gemClose);
+    delete frameRes;
+    frameRes = nullptr;
+    return true;
+}
+
+void RkDrmDisplay::OnPageFlipEvent(int fd, unsigned int frame, unsigned int sec, unsigned int usec,
+                                   void *userData) {
+    (void)fd;
+    (void)frame;
+    (void)sec;
+    (void)usec;
+    RkDrmDisplay *display = reinterpret_cast<RkDrmDisplay *>(userData);
+    if (!display)
+        return;
+
+    display->m_flipPending = false;
+    if (display->m_frameQueue.size() > 1) {
+        FrameResourse *oldRes = display->m_frameQueue.front();
+        display->m_frameQueue.pop_front();
+        display->FreeFrameRes(oldRes);
+    }
+}
+
+bool RkDrmDisplay::PumpDrmEvents(int timeoutMs) {
+    if (!m_flipPending)
+        return true;
+
+    struct pollfd pfd = {};
+    pfd.fd = *m_devFd;
+    pfd.events = POLLIN;
+    int ret = poll(&pfd, 1, timeoutMs);
+    if (ret <= 0 || !(pfd.revents & POLLIN))
+        return false;
+
+    drmEventContext eventCtx = {};
+    eventCtx.version = DRM_EVENT_CONTEXT_VERSION;
+    eventCtx.page_flip_handler = RkDrmDisplay::OnPageFlipEvent;
+    ret = drmHandleEvent(*m_devFd, &eventCtx);
+    if (ret < 0)
+        return false;
+
+    return !m_flipPending;
+}
+
+bool RkDrmDisplay::GetObjectPropertyId(uint32_t objectId, uint32_t objectType, const char *propertyName,
+                                       uint32_t &propertyId) {
+    propertyId = 0;
+    std::shared_ptr<drmModeObjectProperties> objectPtr(
+        drmModeObjectGetProperties(*m_devFd, objectId, objectType),
+        [](drmModeObjectPropertiesPtr ptr) { drmModeFreeObjectProperties(ptr); });
+    if (!objectPtr)
+        return false;
+
+    for (uint32_t i = 0; i < objectPtr->count_props; i++) {
+        std::shared_ptr<drmModePropertyRes> resPtr(
+            drmModeGetProperty(*m_devFd, objectPtr->props[i]),
+            [](drmModePropertyPtr ptr) { drmModeFreeProperty(ptr); });
+        if (!resPtr)
+            continue;
+        if (!strcmp(resPtr->name, propertyName)) {
+            propertyId = resPtr->prop_id;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool RkDrmDisplay::AtomicSetPlane(uint32_t fbId, int32_t crtcX, int32_t crtcY, uint32_t crtcWidth,
+                                  uint32_t crtcHeight, uint32_t srcWidth, uint32_t srcHeight) {
+    PumpDrmEvents(0);
+    if (m_flipPending) {
+        errno = EBUSY;
+        return false;
+    }
+
+    const uint32_t planeId = m_planes->at(m_planeIndex)->plane_id;
+    const uint32_t crtcId = m_crtcs->at(m_crtcIndex)->crtc_id;
+
+    uint32_t propCrtcId = 0;
+    uint32_t propFbId = 0;
+    uint32_t propCrtcX = 0;
+    uint32_t propCrtcY = 0;
+    uint32_t propCrtcW = 0;
+    uint32_t propCrtcH = 0;
+    uint32_t propSrcX = 0;
+    uint32_t propSrcY = 0;
+    uint32_t propSrcW = 0;
+    uint32_t propSrcH = 0;
+
+    if (!GetObjectPropertyId(planeId, DRM_MODE_OBJECT_PLANE, "CRTC_ID", propCrtcId) ||
+        !GetObjectPropertyId(planeId, DRM_MODE_OBJECT_PLANE, "FB_ID", propFbId) ||
+        !GetObjectPropertyId(planeId, DRM_MODE_OBJECT_PLANE, "CRTC_X", propCrtcX) ||
+        !GetObjectPropertyId(planeId, DRM_MODE_OBJECT_PLANE, "CRTC_Y", propCrtcY) ||
+        !GetObjectPropertyId(planeId, DRM_MODE_OBJECT_PLANE, "CRTC_W", propCrtcW) ||
+        !GetObjectPropertyId(planeId, DRM_MODE_OBJECT_PLANE, "CRTC_H", propCrtcH) ||
+        !GetObjectPropertyId(planeId, DRM_MODE_OBJECT_PLANE, "SRC_X", propSrcX) ||
+        !GetObjectPropertyId(planeId, DRM_MODE_OBJECT_PLANE, "SRC_Y", propSrcY) ||
+        !GetObjectPropertyId(planeId, DRM_MODE_OBJECT_PLANE, "SRC_W", propSrcW) ||
+        !GetObjectPropertyId(planeId, DRM_MODE_OBJECT_PLANE, "SRC_H", propSrcH)) {
+        YLOG_ERROR("AtomicSetPlane: get plane property id failed.");
+        return false;
+    }
+
+    drmModeAtomicReqPtr req = drmModeAtomicAlloc();
+    if (!req) {
+        YLOG_ERROR("AtomicSetPlane: drmModeAtomicAlloc failed.");
+        return false;
+    }
+
+    int ret = 0;
+    ret |= drmModeAtomicAddProperty(req, planeId, propCrtcId, fbId ? crtcId : 0);
+    ret |= drmModeAtomicAddProperty(req, planeId, propFbId, fbId);
+    ret |= drmModeAtomicAddProperty(req, planeId, propCrtcX, crtcX);
+    ret |= drmModeAtomicAddProperty(req, planeId, propCrtcY, crtcY);
+    ret |= drmModeAtomicAddProperty(req, planeId, propCrtcW, crtcWidth);
+    ret |= drmModeAtomicAddProperty(req, planeId, propCrtcH, crtcHeight);
+    ret |= drmModeAtomicAddProperty(req, planeId, propSrcX, 0);
+    ret |= drmModeAtomicAddProperty(req, planeId, propSrcY, 0);
+    ret |= drmModeAtomicAddProperty(req, planeId, propSrcW, static_cast<uint64_t>(srcWidth) << 16);
+    ret |= drmModeAtomicAddProperty(req, planeId, propSrcH, static_cast<uint64_t>(srcHeight) << 16);
+    if (ret < 0) {
+        YLOG_ERROR("AtomicSetPlane: drmModeAtomicAddProperty failed.");
+        drmModeAtomicFree(req);
+        return false;
+    }
+
+    ret = drmModeAtomicCommit(*m_devFd, req, DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT, this);
+    drmModeAtomicFree(req);
+    if (ret < 0) {
+        YLOG_ERROR("AtomicSetPlane: drmModeAtomicCommit failed, ret=%d", ret);
+        return false;
+    }
+    m_flipPending = true;
+    return true;
 }
 
 void RkDrmDisplay::SetRotateAngleVideo(AVFrame *&frame, RotateAngle rotation) {
@@ -448,32 +593,17 @@ bool RkDrmDisplay::DisplayDrmFrame(AVFrame *frame) {
         return false;
     }
 
-    ret = drmModeSetPlane(*m_devFd, m_planes->at(m_planeIndex)->plane_id,
-                          m_crtcs->at(m_crtcIndex)->crtc_id, resourse->bufId, 0, m_crtcX, m_crtcY,
-                          m_crtcWidth, m_crtcHeight, 0 << 16, 0 << 16, frame->width << 16,
-                          frame->height << 16);
-    if (ret) {
-        YLOG_ERROR("drmModeSetPlane failed.");
+    if (!AtomicSetPlane(resourse->bufId, m_crtcX, m_crtcY, m_crtcWidth, m_crtcHeight, frame->width,
+                        frame->height)) {
+        if (errno != EBUSY)
+            YLOG_ERROR("AtomicSetPlane failed.");
         av_frame_free(&frame);
         drmModeRmFB(*m_devFd, resourse->bufId);
         drmIoctl(*m_devFd, DRM_IOCTL_GEM_CLOSE, &resourse->gemClose);
         return false;
     }
 
-    drmVBlank vbl;
-    vbl.request.type = DRM_VBLANK_RELATIVE;
-    vbl.request.sequence = 1;
-    drmWaitVBlank(*m_devFd, &vbl);
-    if (m_frameRes) {
-        if (m_frameRes->frame)
-			av_frame_free(&m_frameRes->frame);
-
-        if (m_frameRes->bufId)
-            drmModeRmFB(*m_devFd, m_frameRes->bufId);
-        drmIoctl(*m_devFd, DRM_IOCTL_GEM_CLOSE, &m_frameRes->gemClose);
-        delete m_frameRes;
-    }
-    m_frameRes = resourse;
+    m_frameQueue.push_back(resourse);
     return true;
 }
 
@@ -603,12 +733,6 @@ bool RkDrmDisplay::DisplayNormalFrame(AVFrame *frame) {
         }
     }
 
-    drmVBlank vbl;
-    vbl.request.type = DRM_VBLANK_RELATIVE;
-    vbl.request.sequence = 1;
-    drmWaitVBlank(*m_devFd, &vbl);
-
-
     int64_t frameSize = frame->width * frame->height;
 
     if (frame->format == AV_PIX_FMT_NV12) {
@@ -640,11 +764,11 @@ bool RkDrmDisplay::DisplayNormalFrame(AVFrame *frame) {
         }
     }
 
-    int ret;
-    ret = drmModeSetPlane(*m_devFd, m_planes->at(m_planeIndex)->plane_id,
-                          m_crtcs->at(m_crtcIndex)->crtc_id, m_mapRes->bufId, 0, m_crtcX, m_crtcY,
-                          m_crtcWidth, m_crtcHeight, 0, 0, m_mapRes->width << 16,
-                          m_mapRes->height << 16);
+    if (!AtomicSetPlane(m_mapRes->bufId, m_crtcX, m_crtcY, m_crtcWidth, m_crtcHeight,
+                        m_mapRes->width, m_mapRes->height)) {
+        if (errno != EBUSY)
+            YLOG_ERROR("AtomicSetPlane failed.");
+    }
 
 //    for (int i = 0; i < AV_NUM_DATA_POINTERS; i++) {
 //        if (frame->data[i])
@@ -821,6 +945,6 @@ void RkDrmDisplay::Display(AVFrame *frame) {
 }
 
 void RkDrmDisplay::ClearDisplay() {
-    drmModeSetPlane(*m_devFd, m_planes->at(m_planeIndex)->plane_id,
-                    m_crtcs->at(m_crtcIndex)->crtc_id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    PumpDrmEvents(0);
+    AtomicSetPlane(0, 0, 0, 0, 0, 0, 0);
 }
