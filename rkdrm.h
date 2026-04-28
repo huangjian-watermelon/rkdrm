@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <vector>
+#include <deque>
 #include "xf86drmMode.h"
 #include <rockchip/mpp_frame.h>
 extern "C"
@@ -116,8 +117,7 @@ private:
         uint64_t size;
         uint8_t *mapping = nullptr;
     } *m_mapRes;
-    FrameResourse *m_frameRes;
-    FrameResourse *m_prevFrameRes;
+    std::deque<FrameResourse *> m_frameQueue;
     char* m_dataText = nullptr;
     size_t m_dataTextSize = 0;
 };

@@ -10,6 +10,7 @@ extern "C" {
 #include <rockchip/mpp_buffer.h>
 #include <rockchip/mpp_time.h>
 }
+#include <errno.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <xf86drm.h>
@@ -46,9 +47,7 @@ RkDrmDisplay::RkDrmDisplay()
       m_crtcHeight(0),
       m_planeIndex(0),
       m_crtcIndex(0),
-      m_mapRes(nullptr),
-      m_frameRes(nullptr),
-      m_prevFrameRes(nullptr) {
+      m_mapRes(nullptr) {
     static bool init = RkDrmDisplay::InitDrm();
 }
 
@@ -58,8 +57,10 @@ RkDrmDisplay::~RkDrmDisplay() {
         m_mapRes = nullptr;
     }
 
-    if (m_frameRes) {
-        FreeFrameRes(m_frameRes);
+    while (!m_frameQueue.empty()) {
+        FrameResourse *res = m_frameQueue.front();
+        m_frameQueue.pop_front();
+        FreeFrameRes(res);
     }
 
     if (m_prevFrameRes) {
@@ -159,6 +160,110 @@ bool RkDrmDisplay::AtomicSetPlane(uint32_t fbId, int32_t crtcX, int32_t crtcY, u
     }
 
     ret = drmModeAtomicCommit(*m_devFd, req, DRM_MODE_ATOMIC_NONBLOCK, nullptr);
+    drmModeAtomicFree(req);
+    if (ret < 0) {
+        YLOG_ERROR("AtomicSetPlane: drmModeAtomicCommit failed, ret=%d", ret);
+        return false;
+    }
+    return true;
+}
+
+bool RkDrmDisplay::FreeFrameRes(FrameResourse *&frameRes) {
+    if (!frameRes)
+        return true;
+
+    if (frameRes->frame)
+        av_frame_free(&frameRes->frame);
+    if (frameRes->bufId)
+        drmModeRmFB(*m_devFd, frameRes->bufId);
+    drmIoctl(*m_devFd, DRM_IOCTL_GEM_CLOSE, &frameRes->gemClose);
+    delete frameRes;
+    frameRes = nullptr;
+    return true;
+}
+
+bool RkDrmDisplay::GetObjectPropertyId(uint32_t objectId, uint32_t objectType, const char *propertyName,
+                                       uint32_t &propertyId) {
+    propertyId = 0;
+    std::shared_ptr<drmModeObjectProperties> objectPtr(
+        drmModeObjectGetProperties(*m_devFd, objectId, objectType),
+        [](drmModeObjectPropertiesPtr ptr) { drmModeFreeObjectProperties(ptr); });
+    if (!objectPtr)
+        return false;
+
+    for (uint32_t i = 0; i < objectPtr->count_props; i++) {
+        std::shared_ptr<drmModePropertyRes> resPtr(
+            drmModeGetProperty(*m_devFd, objectPtr->props[i]),
+            [](drmModePropertyPtr ptr) { drmModeFreeProperty(ptr); });
+        if (!resPtr)
+            continue;
+        if (!strcmp(resPtr->name, propertyName)) {
+            propertyId = resPtr->prop_id;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool RkDrmDisplay::AtomicSetPlane(uint32_t fbId, int32_t crtcX, int32_t crtcY, uint32_t crtcWidth,
+                                  uint32_t crtcHeight, uint32_t srcWidth, uint32_t srcHeight) {
+    const uint32_t planeId = m_planes->at(m_planeIndex)->plane_id;
+    const uint32_t crtcId = m_crtcs->at(m_crtcIndex)->crtc_id;
+
+    uint32_t propCrtcId = 0;
+    uint32_t propFbId = 0;
+    uint32_t propCrtcX = 0;
+    uint32_t propCrtcY = 0;
+    uint32_t propCrtcW = 0;
+    uint32_t propCrtcH = 0;
+    uint32_t propSrcX = 0;
+    uint32_t propSrcY = 0;
+    uint32_t propSrcW = 0;
+    uint32_t propSrcH = 0;
+
+    if (!GetObjectPropertyId(planeId, DRM_MODE_OBJECT_PLANE, "CRTC_ID", propCrtcId) ||
+        !GetObjectPropertyId(planeId, DRM_MODE_OBJECT_PLANE, "FB_ID", propFbId) ||
+        !GetObjectPropertyId(planeId, DRM_MODE_OBJECT_PLANE, "CRTC_X", propCrtcX) ||
+        !GetObjectPropertyId(planeId, DRM_MODE_OBJECT_PLANE, "CRTC_Y", propCrtcY) ||
+        !GetObjectPropertyId(planeId, DRM_MODE_OBJECT_PLANE, "CRTC_W", propCrtcW) ||
+        !GetObjectPropertyId(planeId, DRM_MODE_OBJECT_PLANE, "CRTC_H", propCrtcH) ||
+        !GetObjectPropertyId(planeId, DRM_MODE_OBJECT_PLANE, "SRC_X", propSrcX) ||
+        !GetObjectPropertyId(planeId, DRM_MODE_OBJECT_PLANE, "SRC_Y", propSrcY) ||
+        !GetObjectPropertyId(planeId, DRM_MODE_OBJECT_PLANE, "SRC_W", propSrcW) ||
+        !GetObjectPropertyId(planeId, DRM_MODE_OBJECT_PLANE, "SRC_H", propSrcH)) {
+        YLOG_ERROR("AtomicSetPlane: get plane property id failed.");
+        return false;
+    }
+
+    drmModeAtomicReqPtr req = drmModeAtomicAlloc();
+    if (!req) {
+        YLOG_ERROR("AtomicSetPlane: drmModeAtomicAlloc failed.");
+        return false;
+    }
+
+    int ret = 0;
+    ret |= drmModeAtomicAddProperty(req, planeId, propCrtcId, fbId ? crtcId : 0);
+    ret |= drmModeAtomicAddProperty(req, planeId, propFbId, fbId);
+    ret |= drmModeAtomicAddProperty(req, planeId, propCrtcX, crtcX);
+    ret |= drmModeAtomicAddProperty(req, planeId, propCrtcY, crtcY);
+    ret |= drmModeAtomicAddProperty(req, planeId, propCrtcW, crtcWidth);
+    ret |= drmModeAtomicAddProperty(req, planeId, propCrtcH, crtcHeight);
+    ret |= drmModeAtomicAddProperty(req, planeId, propSrcX, 0);
+    ret |= drmModeAtomicAddProperty(req, planeId, propSrcY, 0);
+    ret |= drmModeAtomicAddProperty(req, planeId, propSrcW, static_cast<uint64_t>(srcWidth) << 16);
+    ret |= drmModeAtomicAddProperty(req, planeId, propSrcH, static_cast<uint64_t>(srcHeight) << 16);
+    if (ret < 0) {
+        YLOG_ERROR("AtomicSetPlane: drmModeAtomicAddProperty failed.");
+        drmModeAtomicFree(req);
+        return false;
+    }
+
+    ret = drmModeAtomicCommit(*m_devFd, req, DRM_MODE_ATOMIC_NONBLOCK, nullptr);
+    if (ret == -EBUSY) {
+        // 上一次 nonblock commit 还在进行中时，降级成阻塞提交，避免丢帧导致卡顿。
+        ret = drmModeAtomicCommit(*m_devFd, req, 0, nullptr);
+    }
     drmModeAtomicFree(req);
     if (ret < 0) {
         YLOG_ERROR("AtomicSetPlane: drmModeAtomicCommit failed, ret=%d", ret);
@@ -557,9 +662,12 @@ bool RkDrmDisplay::DisplayDrmFrame(AVFrame *frame) {
         return false;
     }
 
-    FreeFrameRes(m_prevFrameRes);
-    m_prevFrameRes = m_frameRes;
-    m_frameRes = resourse;
+    m_frameQueue.push_back(resourse);
+    while (m_frameQueue.size() > 4) {
+        FrameResourse *oldRes = m_frameQueue.front();
+        m_frameQueue.pop_front();
+        FreeFrameRes(oldRes);
+    }
     return true;
 }
 
