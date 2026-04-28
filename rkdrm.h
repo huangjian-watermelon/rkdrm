@@ -73,6 +73,9 @@ private:
     bool GetObjectPropertyId(uint32_t objectId, uint32_t objectType, const char *propertyName,
                              uint32_t &propertyId);
     bool FreeFrameRes(FrameResourse *&frameRes);
+    bool PumpDrmEvents(int timeoutMs);
+    static void OnPageFlipEvent(int fd, unsigned int frame, unsigned int sec, unsigned int usec,
+                                void *userData);
 
     bool DisplayDrmFrame(AVFrame *frame);
     bool DisplayNormalFrame(AVFrame *frame);
@@ -116,6 +119,7 @@ private:
         uint8_t *mapping = nullptr;
     } *m_mapRes;
     std::deque<FrameResourse *> m_frameQueue;
+    bool m_flipPending;
     char* m_dataText = nullptr;
     size_t m_dataTextSize = 0;
 };
