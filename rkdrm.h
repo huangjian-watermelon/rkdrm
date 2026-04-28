@@ -79,8 +79,6 @@ private:
 
     bool AllocDrmPrimeFrame(uint32_t width, uint32_t height, AVFrame *frame);
 
-    void FreeDrmFrameAfterDisplay(AVFrame *frame);
-
     static bool OpenDrmFd(std::shared_ptr<int> fd);
 
     static bool GetDrmInfo(std::shared_ptr<int> fd);
